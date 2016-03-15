@@ -24,11 +24,14 @@ import com.netflix.spinnaker.orca.bakery.api.BakeryService
 import com.netflix.spinnaker.orca.clouddriver.InstanceService
 import com.netflix.spinnaker.orca.clouddriver.OortService
 import com.netflix.spinnaker.orca.clouddriver.utils.OortHelper
-import com.netflix.spinnaker.orca.pipeline.LinearStage
+import com.netflix.spinnaker.orca.pipeline.StageDefinitionBuilder
+import com.netflix.spinnaker.orca.pipeline.model.Execution
 import com.netflix.spinnaker.orca.pipeline.model.Stage
+import com.netflix.spinnaker.orca.pipeline.model.SyntheticStageOwner
 import com.netflix.spinnaker.orca.pipeline.util.OperatingSystem
 import com.netflix.spinnaker.orca.pipeline.util.PackageInfo
 import com.netflix.spinnaker.orca.pipeline.util.PackageType
+import groovy.util.logging.Slf4j
 import com.squareup.okhttp.OkHttpClient
 import org.springframework.batch.core.Step
 import org.springframework.beans.factory.annotation.Autowired
@@ -36,7 +39,11 @@ import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Component
 import retrofit.RestAdapter
 import retrofit.RetrofitError
+import retrofit.client.Client
 import retrofit.client.OkClient
+
+import java.util.concurrent.ConcurrentHashMap
+import static com.netflix.spinnaker.orca.pipeline.StageDefinitionBuilder.StageDefinitionBuilderSupport.newStage
 
 /**
  * Wrapper stage over BuilkQuickPatchStage.  We do this so we can reuse the same steps whether or not we are doing
@@ -46,7 +53,7 @@ import retrofit.client.OkClient
  */
 @Slf4j
 @Component
-class QuickPatchStage extends LinearStage {
+class QuickPatchStage implements StageDefinitionBuilder {
 
   @Autowired
   BulkQuickPatchStage bulkQuickPatchStage
@@ -69,62 +76,78 @@ class QuickPatchStage extends LinearStage {
   @Autowired
   OortHelper oortHelper
 
+  @Autowired
+  Client retrofitClient
+
   public static final String PIPELINE_CONFIG_TYPE = "quickPatch"
 
   private static INSTANCE_VERSION_SLEEP = 10000
 
-  QuickPatchStage() {
-    super(PIPELINE_CONFIG_TYPE)
-  }
-
   @Override
-  List<Step> buildSteps(Stage stage) {
-    List<Step> steps = []
+  def <T extends Execution> List<Stage<T>> aroundStages(Stage<T> parentStage) {
+    def stages = []
 
     PackageType packageType
     if (roscoApisEnabled) {
-      def baseImage = bakeryService.getBaseImage(stage.context.cloudProviderType as String,
-                                                 stage.context.baseOs as String).toBlocking().single()
+      def baseImage = bakeryService.getBaseImage(parentStage.context.cloudProviderType as String,
+                                                 parentStage.context.baseOs as String).toBlocking().single()
       packageType = baseImage.packageType
     } else {
-      OperatingSystem operatingSystem = OperatingSystem.valueOf(stage.context.baseOs as String)
+      OperatingSystem operatingSystem = OperatingSystem.valueOf(parentStage.context.baseOs as String)
       packageType = operatingSystem.packageType
     }
-    PackageInfo packageInfo = new PackageInfo(stage,
+    PackageInfo packageInfo = new PackageInfo(parentStage,
                                               packageType.packageType,
                                               packageType.versionDelimiter,
                                               true /* extractBuildDetails */,
                                               true /* extractVersion */,
                                               objectMapper)
-    String version = stage.context?.patchVersion ?:  packageInfo.findTargetPackage(allowMissingPackageInstallation)?.packageVersion
+    String version = parentStage.context?.patchVersion ?:  packageInfo.findTargetPackage(allowMissingPackageInstallation)?.packageVersion
 
-    stage.context.put("version", version) // so the ui can display the discovered package version and we can verify for skipUpToDate
-    def instances = getInstancesForCluster(stage)
+    parentStage.context.put("version", version) // so the ui can display the discovered package version and we can verify for skipUpToDate
+    def instances = getInstancesForCluster(parentStage)
 
-    if(instances.size() == 0) {
+    if (instances.size() == 0) {
       // skip since nothing to do
-    } else if(stage.context.rollingPatch) { // rolling means instances in the asg will be updated sequentially
+    } else if (parentStage.context.rollingPatch) { // rolling means instances in the asg will be updated sequentially
       instances.each { key, value ->
         def instance = [:]
         instance.put(key, value)
         def nextStageContext = [:]
-        nextStageContext.putAll(stage.context)
-        nextStageContext << [instances : instance]
+        nextStageContext.putAll(parentStage.context)
+        nextStageContext << [instances: instance]
         nextStageContext.put("instanceIds", [key]) // for WaitForDown/UpInstancesTask
-        injectAfter(stage, "bulkQuickPatchStage", bulkQuickPatchStage, nextStageContext)
+
+        stages << newStage(
+          parentStage.execution,
+          bulkQuickPatchStage.type,
+          "bulkQuickPatchStage",
+          nextStageContext,
+          parentStage,
+          SyntheticStageOwner.STAGE_AFTER
+        )
       }
     } else { // quickpatch all instances in the asg at once
       def nextStageContext = [:]
-      nextStageContext.putAll(stage.context)
-      nextStageContext << [instances : instances]
-      nextStageContext.put("instanceIds", instances.collect {key, value -> key}) // for WaitForDown/UpInstancesTask
-      injectAfter(stage, "bulkQuickPatchStage", bulkQuickPatchStage, nextStageContext)
+      nextStageContext.putAll(parentStage.context)
+      nextStageContext << [instances: instances]
+      nextStageContext.put("instanceIds", instances.collect { key, value -> key }) // for WaitForDown/UpInstancesTask
+
+      stages << newStage(
+        parentStage.execution,
+        bulkQuickPatchStage.type,
+        "bulkQuickPatchStage",
+        nextStageContext,
+        parentStage,
+        SyntheticStageOwner.STAGE_AFTER
+      )
     }
 
-    stage.initializationStage = true
+    parentStage.initializationStage = true
     // mark as SUCCEEDED otherwise a stage w/o child tasks will remain in NOT_STARTED
-    stage.status = ExecutionStatus.SUCCEEDED
-    return steps
+    parentStage.status = ExecutionStatus.SUCCEEDED
+
+    return stages
   }
 
   Map getInstancesForCluster(Stage stage) {

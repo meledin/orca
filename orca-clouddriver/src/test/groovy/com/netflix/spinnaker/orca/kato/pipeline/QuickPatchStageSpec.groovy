@@ -18,11 +18,12 @@ package com.netflix.spinnaker.orca.kato.pipeline
 
 import com.netflix.spectator.api.NoopRegistry
 import com.netflix.spinnaker.kork.jedis.EmbeddedRedis
-import com.netflix.spinnaker.orca.batch.TaskTaskletAdapter
-import com.netflix.spinnaker.orca.jackson.OrcaObjectMapper
+import com.netflix.spinnaker.orca.batch.TaskTaskletAdapterImpl
+import com.netflix.spinnaker.orca.batch.stages.SpringBatchStageBuilderProvider
 import com.netflix.spinnaker.orca.clouddriver.InstanceService
 import com.netflix.spinnaker.orca.clouddriver.OortService
 import com.netflix.spinnaker.orca.clouddriver.utils.OortHelper
+import com.netflix.spinnaker.orca.jackson.OrcaObjectMapper
 import com.netflix.spinnaker.orca.pipeline.model.Pipeline
 import com.netflix.spinnaker.orca.pipeline.model.PipelineStage
 import com.netflix.spinnaker.orca.pipeline.persistence.jedis.JedisExecutionRepository
@@ -30,6 +31,7 @@ import com.netflix.spinnaker.orca.pipeline.util.StageNavigator
 import org.springframework.batch.core.configuration.annotation.StepBuilderFactory
 import org.springframework.batch.core.repository.JobRepository
 import org.springframework.context.ApplicationContext
+import org.springframework.context.support.GenericApplicationContext
 import org.springframework.transaction.PlatformTransactionManager
 import redis.clients.jedis.Jedis
 import redis.clients.util.Pool
@@ -66,17 +68,12 @@ class QuickPatchStageSpec extends Specification {
 
   def objectMapper = new OrcaObjectMapper()
   def executionRepository = new JedisExecutionRepository(new NoopRegistry(), jedisPool, 1, 50)
+
   InstanceService instanceService = Mock(InstanceService)
 
   void setup() {
     GroovyMock(OortHelper, global: true)
-
-    quickPatchStage.applicationContext = Stub(ApplicationContext) {
-      getBean(_) >> { Class type -> type.newInstance() }
-    }
     quickPatchStage.objectMapper = objectMapper
-    quickPatchStage.steps = new StepBuilderFactory(Stub(JobRepository), Stub(PlatformTransactionManager))
-    quickPatchStage.taskTaskletAdapter = new TaskTaskletAdapter(executionRepository, [], stageNavigator)
     quickPatchStage.oortService = oort
     quickPatchStage.bulkQuickPatchStage = bulkQuickPatchStage
     quickPatchStage.INSTANCE_VERSION_SLEEP = 1
@@ -99,7 +96,7 @@ class QuickPatchStageSpec extends Specification {
     stage.afterStages = new NeverClearedArrayList()
 
     when:
-    quickPatchStage.buildSteps(stage)
+    quickPatchStage.aroundStages(stage)
 
     then:
     1 * oortHelper.getInstancesForCluster(config, null, true, false) >> { throw new RuntimeException("too many asgs!") }
@@ -129,16 +126,14 @@ class QuickPatchStageSpec extends Specification {
     stage.afterStages = new NeverClearedArrayList()
 
     when:
-    quickPatchStage.buildSteps(stage)
+    def syntheticStages = quickPatchStage.aroundStages(stage)
 
     then:
-    1 == stage.afterStages.size()
+    syntheticStages.size() == 1
+    syntheticStages*.type == [bulkQuickPatchStage.type]
 
     and:
-    stage.afterStages*.stageBuilder.unique() == [bulkQuickPatchStage]
-
-    and:
-    with(stage.afterStages[0].context) {
+    with(syntheticStages[0].context) {
       application == "deck"
       account == "account"
       region == "us-east-1"
@@ -165,19 +160,19 @@ class QuickPatchStageSpec extends Specification {
     stage.afterStages = new NeverClearedArrayList()
 
     when:
-    quickPatchStage.buildSteps(stage)
+    def syntheticStages = quickPatchStage.aroundStages(stage)
 
     then:
     1 * oortHelper.getInstancesForCluster(config, null, true, false) >> expectedInstances
 
     and:
-    2 == stage.afterStages.size()
+    syntheticStages.size() == 2
 
     and:
-    stage.afterStages*.stageBuilder.unique() == [bulkQuickPatchStage]
+    syntheticStages*.type.unique() == [bulkQuickPatchStage.type]
 
     and:
-    with(stage.afterStages[0].context) {
+    with(syntheticStages[0].context) {
       application == "deck"
       account == "account"
       region == "us-east-1"
@@ -191,7 +186,7 @@ class QuickPatchStageSpec extends Specification {
     }
 
     and:
-    with(stage.afterStages[1].context) {
+    with(syntheticStages[1].context) {
       application == "deck"
       account == "account"
       region == "us-east-1"
@@ -227,7 +222,7 @@ class QuickPatchStageSpec extends Specification {
       patchVersion: "1.2",
       package     : "deck"
     ]
-    def stage = new PipelineStage(null, "quickPatch", config)
+    def stage = new PipelineStage(new Pipeline(), "quickPatch", config)
 
     and:
     stage.beforeStages = new NeverClearedArrayList()
@@ -248,15 +243,15 @@ class QuickPatchStageSpec extends Specification {
       )
     )
     when:
-    quickPatchStage.buildSteps(stage)
+    def syntheticStages = quickPatchStage.aroundStages(stage)
 
     then:
     1 * oortHelper.getInstancesForCluster(config, null, true, false) >> expectedInstances
 
     and:
     stage.context.skippedInstances.'i-2345'
-    stage.afterStages.size() == 1
-    with(stage.afterStages[0].context) {
+    syntheticStages.size() == 1
+    with(syntheticStages[0].context) {
       application == application
       account == account
       region == region
@@ -290,7 +285,7 @@ class QuickPatchStageSpec extends Specification {
       patchVersion: "1.2",
       package     : "deck"
     ]
-    def stage = new PipelineStage(null, "quickPatch", config)
+    def stage = new PipelineStage(new Pipeline(), "quickPatch", config)
     1 * quickPatchStage.createInstanceService(_) >> instanceService
     4 * instanceService.getCurrentVersion(_) >> { throw new RetrofitError(null, null, null, null, null, null, null) }
     1 * instanceService.getCurrentVersion(_) >>> new Response(
@@ -302,7 +297,7 @@ class QuickPatchStageSpec extends Specification {
     )
 
     when:
-    quickPatchStage.buildSteps(stage)
+    quickPatchStage.aroundStages(stage)
 
     then:
     1 * oortHelper.getInstancesForCluster(config, null, true, false) >> expectedInstances
