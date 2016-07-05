@@ -127,7 +127,7 @@ class OrcaConfiguration {
   }
 
   @Bean @Scope(SCOPE_PROTOTYPE) // Scope is really important here...
-  SuspendedPipelinesNotificationHandler suspendedPipelinesNotificationHandler(Map input) {
+  SuspendedPipelinesNotificationHandler suspendedPipelinesNotificationHandler(Map<String, Object> input) {
     new SuspendedPipelinesNotificationHandler(input)
   }
 
